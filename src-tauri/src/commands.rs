@@ -5,6 +5,11 @@
 //! threads so the UI never freezes.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
 
 use qmc_decoder::{decrypt_file, fetch_ekey, get_qqmusic_credentials, info_file};
 use qmc_decoder::{determine_output_path, Format, FooterInfo};
@@ -47,7 +52,17 @@ impl FileResult {
     }
 }
 
+#[derive(Debug)]
+enum WorkItem {
+    File(PathBuf),
+    Error(PathBuf, String),
+}
+
 /// Decrypt a list of files and/or directories, returning one result per file.
+///
+/// Files are processed by a bounded worker pool. This makes large batches use
+/// multiple CPU cores and overlap disk IO without creating an unbounded number
+/// of threads for very large music libraries.
 #[tauri::command]
 pub async fn decrypt_paths(
     app: tauri::AppHandle,
@@ -60,94 +75,101 @@ pub async fn decrypt_paths(
     let output_dir = output_dir.filter(|s| !s.trim().is_empty());
 
     tauri::async_runtime::spawn_blocking(move || {
-        // Count how many files will be processed so the frontend can show a
-        // determinate progress bar (directories expand into child files).
-        let mut total: usize = 0;
-        let mut count_ok = true;
-        for p in &paths {
-            let input = PathBuf::from(p);
-            if input.is_dir() {
-                total += count_supported(&input);
-            } else if input.exists() {
-                total += 1;
-            } else {
-                count_ok = false;
-            }
-        }
-        if !count_ok {
-            // Fall back to the number of explicit inputs.
-            total = paths.len();
-        }
-        let _ = app.emit("decrypt-started", total);
-        // Ensure the output directory exists up-front so it doesn't fail per file.
         if let Some(dir) = output_dir.as_deref() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("无法创建输出目录 {}: {}", dir, e))?;
         }
-        let output_dir = output_dir.as_deref().map(Path::new);
 
-        let mut results = Vec::new();
-        let mut done: usize = 0;
+        // Expand directories once before starting the worker pool. Doing this
+        // up front gives the frontend an accurate total and avoids repeatedly
+        // walking the same directory tree in different threads.
+        let mut work = Vec::new();
         for p in paths {
             let input = PathBuf::from(&p);
             if !input.exists() {
-                done += 1;
-                emit_progress(&app, done);
-                results.push(FileResult::err(&input, "路径不存在"));
+                work.push(WorkItem::Error(input, "路径不存在".to_string()));
                 continue;
             }
+
             if input.is_dir() {
-                match process_dir(&input, output_dir, ekey.as_deref(), fetch_ekey, &app, &mut done) {
-                    Ok(mut rows) => results.append(&mut rows),
-                    Err(msg) => {
-                        done += 1;
-                        emit_progress(&app, done);
-                        results.push(FileResult::err(&input, msg));
-                    }
+                let mut files = Vec::new();
+                collect_supported(&input, &mut files, 0);
+                if files.is_empty() {
+                    work.push(WorkItem::Error(
+                        input,
+                        "目录中没有找到支持的加密文件".to_string(),
+                    ));
+                } else {
+                    files.sort();
+                    work.extend(files.into_iter().map(WorkItem::File));
                 }
-                continue;
+            } else {
+                work.push(WorkItem::File(input));
             }
-            match decrypt_single(&input, output_dir, ekey.as_deref(), fetch_ekey) {
-                Ok(r) => results.push(r),
-                Err((input, msg)) => results.push(FileResult::err(&input, msg)),
-            }
-            done += 1;
-            emit_progress(&app, done);
         }
-        Ok(results)
+
+        let total = work.len();
+        let _ = app.emit("decrypt-started", total);
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Audio decryption is both CPU- and IO-heavy. Cap concurrency so a
+        // huge batch does not exhaust memory or saturate slower disks.
+        let cpu_threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let worker_count = cpu_threads.clamp(2, 8).min(total);
+
+        let work = Arc::new(work);
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let results: Arc<Mutex<Vec<Option<FileResult>>>> =
+            Arc::new(Mutex::new((0..total).map(|_| None).collect()));
+        let output_dir = output_dir.map(PathBuf::from);
+        let ekey = ekey.map(Arc::<str>::from);
+
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let work = Arc::clone(&work);
+                let next = Arc::clone(&next);
+                let done = Arc::clone(&done);
+                let results = Arc::clone(&results);
+                let output_dir = output_dir.as_deref();
+                let ekey = ekey.as_deref();
+                let app = app.clone();
+
+                scope.spawn(move || loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= work.len() {
+                        break;
+                    }
+
+                    let result = match &work[index] {
+                        WorkItem::File(input) => {
+                            match decrypt_single(input, output_dir, ekey, fetch_ekey) {
+                                Ok(r) => r,
+                                Err((input, msg)) => FileResult::err(&input, msg),
+                            }
+                        }
+                        WorkItem::Error(input, msg) => FileResult::err(input, msg.clone()),
+                    };
+
+                    results.lock().unwrap()[index] = Some(result);
+                    let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_progress(&app, completed);
+                });
+            }
+        });
+
+        let mut guard = results.lock().unwrap();
+        Ok(guard
+            .iter_mut()
+            .map(|slot| slot.take().expect("worker did not produce a result"))
+            .collect())
     })
     .await
     .map_err(|e| format!("后台任务错误: {}", e))?
-}
-
-/// Decrypt every supported file inside a directory.
-/// Reports per-file progress through the same `decrypt-*` events.
-fn process_dir(
-    input: &Path,
-    output_dir: Option<&Path>,
-    ekey: Option<&str>,
-    fetch_ekey: bool,
-    app: &tauri::AppHandle,
-    done: &mut usize,
-) -> Result<Vec<FileResult>, String> {
-    // Recursively collect the supported files (QQ 下载目录里歌曲常按歌手/专辑
-    // 分层存放，只取一层会漏歌）。不可读的目录跳过，深度有上限防邪树/链接环。
-    let mut files = Vec::new();
-    collect_supported(input, &mut files, 0);
-    if files.is_empty() {
-        return Err("目录中没有找到支持的加密文件".to_string());
-    }
-
-    let mut results = Vec::new();
-    for path in files {
-        match decrypt_single(&path, output_dir, ekey, fetch_ekey) {
-            Ok(r) => results.push(r),
-            Err((input, msg)) => results.push(FileResult::err(&input, msg)),
-        }
-        *done += 1;
-        emit_progress(app, *done);
-    }
-    Ok(results)
 }
 
 /// Recursively gather supported (decryptable) file paths under `input`.
@@ -170,13 +192,6 @@ fn collect_supported(input: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             }
         }
     }
-}
-
-/// Number of supported files inside a directory (recursively).
-fn count_supported(input: &Path) -> usize {
-    let mut files = Vec::new();
-    collect_supported(input, &mut files, 0);
-    files.len()
 }
 
 fn emit_progress(app: &tauri::AppHandle, done: usize) {
@@ -444,6 +459,7 @@ pub async fn pick_folder(default_path: Option<String>) -> Result<Option<String>,
     .await
     .map_err(|e| format!("文件夹选择器错误: {}", e))?
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,8 +479,8 @@ mod tests {
         fs::write(a.join("02 星晴.mflac"), b"x").unwrap();
         fs::write(b.join("03 夜曲.qmcogg"), b"x").unwrap();
         fs::write(sub.join("04 七里香.mflac0"), b"x").unwrap();
-        fs::write(sub.join("05 曲谱.pdf"), b"x").unwrap();      // 不支持
-        fs::write(root.join("说明.txt"), b"x").unwrap();         // 不支持
+        fs::write(sub.join("05 曲谱.pdf"), b"x").unwrap();
+        fs::write(root.join("说明.txt"), b"x").unwrap();
         root
     }
 
@@ -474,20 +490,31 @@ mod tests {
         let mut files = Vec::new();
         collect_supported(&root, &mut files, 0);
         fs::remove_dir_all(&root).unwrap();
-        let names: Vec<String> = files.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            names == ["01 晴天.qmcflac", "02 星晴.mflac", "03 夜曲.qmcogg", "04 七里香.mflac0"],
-            "got {:?}", names
+            names == [
+                "01 晴天.qmcflac",
+                "02 星晴.mflac",
+                "03 夜曲.qmcogg",
+                "04 七里香.mflac0"
+            ],
+            "got {:?}",
+            names
         );
     }
 
     #[test]
     fn add_item_expands_dir_and_keeps_file() {
-        let root = make_tree(&std::env::temp_dir().join(format!("qmc_test_f_{}", std::process::id())));
+        let root = make_tree(&std::env::temp_dir().join(format!(
+            "qmc_test_f_{}",
+            std::process::id()
+        )));
         let dir_item = add_item_one(&root).unwrap();
         let file_path = root.join("歌手A/01 晴天.qmcflac");
         let file_item = add_item_one(&file_path).unwrap();
-        // 深度：向下穿过 root/歌手A 一层
         let deep_dir = root.join("d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12");
         fs::create_dir_all(&deep_dir).unwrap();
         fs::write(deep_dir.join("deep.mflac"), b"x").unwrap();
@@ -498,7 +525,19 @@ mod tests {
         assert_eq!(dir_item.songs.len(), 4);
         assert!(!file_item.is_dir);
         assert!(file_item.songs.is_empty());
-        // 深度上限：超过 10 层的文件不应出现
-        assert!(deep_item.songs.iter().all(|s| !s.contains("deep.mflac")), "deep file escaped depth cap");
+        assert!(
+            deep_item.songs.iter().all(|s| !s.contains("deep.mflac")),
+            "deep file escaped depth cap"
+        );
+    }
+
+    #[test]
+    fn worker_count_is_bounded() {
+        let total = 100usize;
+        let cpu_threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let worker_count = cpu_threads.clamp(2, 8).min(total);
+        assert!((1..=8).contains(&worker_count));
     }
 }
